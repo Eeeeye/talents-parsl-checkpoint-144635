@@ -1,0 +1,19 @@
+publication-boundary scenario
+{
+  "before_callback_release": {
+    "checkpoint_visible": false,
+    "execution_count": 2,
+    "first_future_done": true,
+    "second_from_memo": false
+  },
+  "checkpoint_records": 2,
+  "final_execution_count": 2
+}
+cross-run recovery scenario
+{
+  "execution_count": 2,
+  "first_from_memo": false,
+  "second_from_memo": false,
+  "first_run": "/tmp/parsl-checkpoint-incident.REDACTED/restart/runinfo/000",
+  "second_run": "/tmp/parsl-checkpoint-incident.REDACTED/restart/runinfo/001"
+}

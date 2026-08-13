@@ -1,0 +1,55 @@
+schema_version = "1.1"
+
+[task]
+name = "talents/parsl-checkpoint-publication"
+description = "Repair completion visibility, memoization publication, deferred checkpointing, and cross-run recovery in an offline Parsl HPC workflow launcher."
+authors = []
+keywords = ["python", "hpc", "parsl", "workflow", "checkpoint", "concurrency"]
+
+[metadata]
+difficulty = "hard"
+category = "systems"
+tags = ["debugging", "hpc", "concurrency", "persistence", "recovery", "offline"]
+expert_time_estimate_min = 120.0
+junior_time_estimate_min = 300.0
+difficulty_explanation = """
+L3: the Starter builds and runs but violates one user-visible completion boundary
+across asynchronous Future publication, memo-table state, task-exit and deferred
+checkpoint persistence, and numbered run-directory discovery. A local timing
+workaround or one-line path correction leaves other required modes wrong. A
+complete repair must preserve existing APIs and checkpoint compatibility while
+handling None, exceptions, concurrency, explicit recovery, and corrupt input.
+"""
+
+[verifier]
+timeout_sec = 240.0
+user = "root"
+
+[agent]
+timeout_sec = 3600.0
+user = "candidate"
+
+[environment]
+build_timeout_sec = 300.0
+cpus = 2
+memory_mb = 2048
+storage_mb = 4096
+gpus = 0
+allow_internet = true
+mcp_servers = []
+workdir = "/workspace/parsl-checkpoint"
+
+[environment.env]
+PYTHONDONTWRITEBYTECODE = "1"
+PYTHONUNBUFFERED = "1"
+PYTHONPATH = "/workspace/parsl-checkpoint"
+
+[verifier.env]
+PYTHONDONTWRITEBYTECODE = "1"
+PYTHONUNBUFFERED = "1"
+PYTHONPATH = "/workspace/parsl-checkpoint"
+
+[solution.env]
+PYTHONDONTWRITEBYTECODE = "1"
+PYTHONUNBUFFERED = "1"
+PYTHONPATH = "/workspace/parsl-checkpoint"
