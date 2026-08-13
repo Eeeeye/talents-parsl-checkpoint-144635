@@ -28,7 +28,7 @@ if status is not None:
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
 if hasattr(os, "O_NOFOLLOW"):
     flags |= os.O_NOFOLLOW
-descriptor = os.open(path, flags, 0o600)
+descriptor = os.open(path, flags, 0o644)
 try:
     payload = (value + "\n").encode("ascii")
     if os.write(descriptor, payload) != len(payload):
