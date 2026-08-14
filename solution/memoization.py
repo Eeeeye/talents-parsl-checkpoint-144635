@@ -286,21 +286,19 @@ class Memoizer:
             checkpoint_file = os.path.join(checkpoint_dir, 'tasks.pkl')
             try:
                 with open(checkpoint_file, 'rb') as f:
-                    while True:
-                        try:
-                            data = pickle.load(f)
-                            if not isinstance(data, dict) or set(data) != {"hash", "exception", "result"}:
-                                raise ValueError("invalid checkpoint record schema")
-                            if not isinstance(data["hash"], str) or data["exception"] is not None:
-                                raise ValueError("invalid checkpoint record values")
-                            # Copy and hash only the input attributes
-                            memo_fu: Future = Future()
-                            memo_fu.set_result(data['result'])
-                            memo_lookup_table[data['hash']] = memo_fu
-
-                        except EOFError:
-                            # Done with the checkpoint file
-                            break
+                    file_size = os.fstat(f.fileno()).st_size
+                    if file_size == 0:
+                        raise ValueError("empty checkpoint stream")
+                    while f.tell() < file_size:
+                        data = pickle.load(f)
+                        if type(data) is not dict or set(data) != {"hash", "exception", "result"}:
+                            raise ValueError("invalid checkpoint record schema")
+                        if not isinstance(data["hash"], str) or data["exception"] is not None:
+                            raise ValueError("invalid checkpoint record values")
+                        # Copy and hash only the input attributes
+                        memo_fu: Future = Future()
+                        memo_fu.set_result(data['result'])
+                        memo_lookup_table[data['hash']] = memo_fu
             except FileNotFoundError:
                 reason = "Checkpoint file was not found: {}".format(
                     checkpoint_file)

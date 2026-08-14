@@ -141,7 +141,8 @@ ROOT = Path(sys.argv[1])
 ROOT.mkdir(parents=True, exist_ok=True)
 os.chdir(ROOT)
 
-def config(run_root, *, mode="task_exit", files=None, threads=4, period=None, retries=0):
+def config(run_root, *, mode="task_exit", files=None, threads=4, period=None,
+           retries=0, garbage_collect=True):
     kwargs = dict(
         executors=[ThreadPoolExecutor(max_threads=threads, label="local")],
         checkpoint_mode=mode,
@@ -150,6 +151,7 @@ def config(run_root, *, mode="task_exit", files=None, threads=4, period=None, re
         usage_tracking=0,
         strategy="none",
         retries=retries,
+        garbage_collect=garbage_collect,
     )
     if period is not None:
         kwargs["checkpoint_period"] = period
@@ -261,19 +263,17 @@ class TaskTests(unittest.TestCase):
                 return value
 
             dfk = parsl.load(config(ROOT / "runinfo"))
-            entered = threading.Event()
             release = threading.Event()
-            original = dfk.handle_app_update
-            def delayed(record, future):
-                entered.set()
-                if not release.wait(10):
-                    raise RuntimeError("callback gate timed out")
-                return original(record, future)
-            dfk.handle_app_update = delayed
+            original = getattr(dfk, "handle_app_update", None)
+            if original is not None:
+                def delayed(record, future):
+                    if not release.wait(10):
+                        raise RuntimeError("callback gate timed out")
+                    return original(record, future)
+                dfk.handle_app_update = delayed
 
             first = work(TOKEN, VALUE)
             first_value = first.result(timeout=10)
-            assert entered.wait(10)
             checkpoint = Path(dfk.run_dir) / "checkpoint" / "tasks.pkl"
             before = checkpoint.exists()
             records_before = decode(checkpoint) if before else []
@@ -318,30 +318,32 @@ class TaskTests(unittest.TestCase):
                 return None
 
             dfk = parsl.load(config(ROOT / "runinfo"))
-            entered = threading.Event(); release = threading.Event()
-            original = dfk.handle_app_update
-            def delayed(record, future):
-                entered.set()
-                if not release.wait(10): raise RuntimeError("callback gate timed out")
-                return original(record, future)
-            dfk.handle_app_update = delayed
+            release = threading.Event()
+            original = getattr(dfk, "handle_app_update", None)
+            if original is not None:
+                def delayed(record, future):
+                    if not release.wait(10): raise RuntimeError("callback gate timed out")
+                    return original(record, future)
+                dfk.handle_app_update = delayed
             first = return_none(TOKEN)
             first_result = first.result(timeout=10)
-            assert entered.wait(10)
             checkpoint = Path(dfk.run_dir) / "checkpoint" / "tasks.pkl"
-            records = decode(checkpoint)
+            checkpoint_exists = checkpoint.exists()
+            records = decode(checkpoint) if checkpoint_exists else []
             second = return_none(TOKEN)
             second_result = second.result(timeout=10)
             from_memo = bool(second.task_record.get("from_memo"))
             executions = Path("marker.log").read_text().splitlines()
             release.set(); close_dfk()
             emit({{"first_is_none": first_result is None, "second_is_none": second_result is None,
+                  "checkpoint_exists": checkpoint_exists,
                   "checkpoint_none": any(r["result"] is None for r in records),
                   "from_memo": from_memo, "executions": executions}})
             ''',
         )
         self.assertTrue(report["first_is_none"])
         self.assertTrue(report["second_is_none"])
+        self.assertTrue(report["checkpoint_exists"])
         self.assertTrue(report["checkpoint_none"])
         self.assertTrue(report["from_memo"])
         self.assertEqual(report["executions"], [token])
@@ -621,18 +623,41 @@ class TaskTests(unittest.TestCase):
         report = run_probe(
             "invalid_checkpoints",
             r'''
+            class RecordDict(dict):
+                pass
+
             fixtures = {}
             missing = ROOT / "missing"
             fixtures["missing"] = missing
+
+            empty = ROOT / "empty"; empty.mkdir()
+            (empty / "tasks.pkl").write_bytes(b"")
+            fixtures["empty"] = empty
 
             truncated = ROOT / "truncated"; truncated.mkdir()
             valid = pickle.dumps({"hash": "a" * 32, "exception": None, "result": {"x": 1}})
             (truncated / "tasks.pkl").write_bytes(valid + pickle.dumps({"hash": "b" * 32, "exception": None, "result": [1,2,3]})[:-5])
             fixtures["truncated"] = truncated
 
+            eof_suffix = ROOT / "eof_suffix"; eof_suffix.mkdir()
+            (eof_suffix / "tasks.pkl").write_bytes(valid + b"(")
+            fixtures["eof_suffix"] = eof_suffix
+
             wrong_keys = ROOT / "wrong_keys"; wrong_keys.mkdir()
             (wrong_keys / "tasks.pkl").write_bytes(pickle.dumps({"hash": "c" * 32, "result": 7}))
             fixtures["wrong_keys"] = wrong_keys
+
+            dict_subclass = ROOT / "dict_subclass"; dict_subclass.mkdir()
+            (dict_subclass / "tasks.pkl").write_bytes(
+                pickle.dumps(RecordDict(hash="d" * 32, exception=None, result=9))
+            )
+            fixtures["dict_subclass"] = dict_subclass
+
+            exception_record = ROOT / "exception_record"; exception_record.mkdir()
+            (exception_record / "tasks.pkl").write_bytes(
+                pickle.dumps({"hash": "e" * 32, "exception": "not-none", "result": 11})
+            )
+            fixtures["exception_record"] = exception_record
 
             trailing = ROOT / "trailing"; trailing.mkdir()
             (trailing / "tasks.pkl").write_bytes(valid + b"not-a-pickle-record")
@@ -656,9 +681,260 @@ class TaskTests(unittest.TestCase):
             emit(reports)
             ''',
         )
-        for name in ("missing", "truncated", "wrong_keys", "trailing"):
+        for name in (
+            "missing", "empty", "truncated", "eof_suffix", "wrong_keys",
+            "dict_subclass", "exception_record", "trailing",
+        ):
             self.assertEqual(report[name]["outcome"], "BadCheckpoint", name)
             self.assertTrue(report[name]["unchanged"], name)
+
+    def test_12_terminal_futures_finalize_task_table_before_callbacks(self) -> None:
+        token = secrets.token_hex(14)
+        report = run_probe(
+            "terminal_finalization",
+            f'''
+            TOKEN = {token!r}
+
+            @python_app(cache=True)
+            def succeed(token):
+                return {{"token": token, "kind": "success"}}
+
+            @python_app(cache=True)
+            def fail(token):
+                raise RuntimeError("failure-" + token)
+
+            @python_app(cache=False)
+            def consume(value):
+                return value
+
+            @join_app
+            def invalid_join(token):
+                return {{"token": token, "not": "a future"}}
+
+            @join_app
+            def failing_join(token):
+                return fail(token + "-join-inner")
+
+            dfk = parsl.load(config(ROOT / "runinfo", mode="manual", threads=8))
+            callback_gates = {{}}
+            original_callback = getattr(dfk, "handle_app_update", None)
+            if original_callback is not None:
+                def delayed_callback(record, future):
+                    if any(
+                        isinstance(arg, str) and arg.endswith("-join-inner")
+                        for arg in record["args"]
+                    ):
+                        return original_callback(record, future)
+                    gate = callback_gates.setdefault(record["id"], threading.Event())
+                    if not gate.wait(10):
+                        raise RuntimeError("callback gate timed out")
+                    return original_callback(record, future)
+                dfk.handle_app_update = delayed_callback
+
+            observed = []
+            def observe(future):
+                observed.append({{
+                    "tid": future.tid,
+                    "present": future.tid in dfk.tasks,
+                }})
+                callback_gates.setdefault(future.tid, threading.Event()).set()
+
+            first = succeed(TOKEN)
+            first_value = first.result(timeout=10)
+            observe(first)
+            memo = succeed(TOKEN)
+            memo_value = memo.result(timeout=10)
+            observe(memo)
+
+            terminal = fail(TOKEN + "-terminal")
+            try:
+                terminal.result(timeout=10)
+            except BaseException as exc:
+                terminal_error = type(exc).__name__
+            else:
+                terminal_error = "NO_ERROR"
+            observe(terminal)
+
+            dependency_source = fail(TOKEN + "-dependency")
+            dependent = consume(dependency_source)
+            try:
+                dependency_source.result(timeout=10)
+            except BaseException as exc:
+                source_error = type(exc).__name__
+            else:
+                source_error = "NO_ERROR"
+            observe(dependency_source)
+            try:
+                dependent.result(timeout=10)
+            except BaseException as exc:
+                dependency_error = type(exc).__name__
+            else:
+                dependency_error = "NO_ERROR"
+            observe(dependent)
+
+            invalid = invalid_join(TOKEN)
+            try:
+                invalid.result(timeout=10)
+            except BaseException as exc:
+                invalid_error = type(exc).__name__
+            else:
+                invalid_error = "NO_ERROR"
+            observe(invalid)
+
+            joined = failing_join(TOKEN)
+            try:
+                joined.result(timeout=10)
+            except BaseException as exc:
+                join_error = type(exc).__name__
+            else:
+                join_error = "NO_ERROR"
+            observe(joined)
+
+            expected_tids = [
+                first.tid, memo.tid, terminal.tid, dependency_source.tid,
+                dependent.tid, invalid.tid, joined.tid,
+            ]
+            close_dfk()
+
+            retained_dfk = parsl.load(config(
+                ROOT / "retained", mode=None, threads=2, garbage_collect=False
+            ))
+            retained = succeed(TOKEN + "-retained")
+            retained_value = retained.result(timeout=10)
+            retained_after = retained.tid in retained_dfk.tasks
+            close_dfk()
+
+            emit({{
+                "first": first_value,
+                "memo": memo_value,
+                "memo_hit": bool(memo.task_record.get("from_memo")),
+                "errors": [terminal_error, source_error, dependency_error,
+                           invalid_error, join_error],
+                "expected_tids": expected_tids,
+                "observed": observed,
+                "retained": retained_value,
+                "retained_after": retained_after,
+            }})
+            ''',
+            timeout=50,
+        )
+        expected_value = {"token": token, "kind": "success"}
+        self.assertEqual(report["first"], expected_value)
+        self.assertEqual(report["memo"], expected_value)
+        self.assertTrue(report["memo_hit"])
+        self.assertEqual(
+            report["errors"],
+            ["RuntimeError", "RuntimeError", "DependencyError", "TypeError", "JoinError"],
+        )
+        self.assertEqual(report["expected_tids"], [
+            item["tid"] for item in report["observed"]
+        ])
+        self.assertTrue(all(not item["present"] for item in report["observed"]))
+        self.assertEqual(
+            report["retained"],
+            {"token": token + "-retained", "kind": "success"},
+        )
+        self.assertTrue(report["retained_after"])
+
+    def test_13_explicit_empty_checkpoint_list_disables_auto_recovery(self) -> None:
+        token = secrets.token_hex(14)
+        value = {"token": token, "nonce": random.randint(1, 2**31 - 1)}
+        report = run_probe(
+            "explicit_empty_checkpoint_list",
+            f'''
+            TOKEN = {token!r}; VALUE = {value!r}
+
+            @python_app(cache=True)
+            def durable(token, value):
+                import os
+                fd = os.open("marker.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                try: os.write(fd, (token + "\\n").encode()); os.fsync(fd)
+                finally: os.close(fd)
+                return value
+
+            run_root = ROOT / "runinfo"
+            parsl.load(config(run_root))
+            first = durable(TOKEN, VALUE)
+            first_value = first.result(timeout=10)
+            close_dfk()
+
+            parsl.load(config(run_root, files=[]))
+            second = durable(TOKEN, VALUE)
+            second_value = second.result(timeout=10)
+            second_memo = bool(second.task_record.get("from_memo"))
+            second_run = Path(parsl.dfk().run_dir).name
+            close_dfk()
+            emit({{
+                "first": first_value,
+                "second": second_value,
+                "second_memo": second_memo,
+                "second_run": second_run,
+                "executions": Path("marker.log").read_text().splitlines(),
+            }})
+            ''',
+        )
+        self.assertEqual(report["first"], value)
+        self.assertEqual(report["second"], value)
+        self.assertFalse(report["second_memo"])
+        self.assertEqual(report["second_run"], "001")
+        self.assertEqual(report["executions"], [token, token])
+
+    def test_14_auto_recovery_uses_numeric_runs_and_ignores_other_dirs(self) -> None:
+        token = secrets.token_hex(14)
+        newest = {"token": token, "source": "run-1000", "value": random.random()}
+        report = run_probe(
+            "numeric_checkpoint_order",
+            f'''
+            TOKEN = {token!r}; NEWEST = {newest!r}
+
+            @python_app(cache=True)
+            def durable(token):
+                import os
+                fd = os.open("marker.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                try: os.write(fd, (token + "\\n").encode()); os.fsync(fd)
+                finally: os.close(fd)
+                return {{"token": token, "source": "executed"}}
+
+            run_root = ROOT / "runinfo"
+            parsl.load(config(run_root))
+            initial = durable(TOKEN)
+            initial_value = initial.result(timeout=10)
+            initial_checkpoint = Path(parsl.dfk().run_dir) / "checkpoint" / "tasks.pkl"
+            close_dfk()
+            template = decode(initial_checkpoint)[0]
+
+            older_dir = run_root / "999" / "checkpoint"
+            newer_dir = run_root / "1000" / "checkpoint"
+            unrelated_dir = run_root / "scratch" / "checkpoint"
+            older_dir.mkdir(parents=True)
+            newer_dir.mkdir(parents=True)
+            unrelated_dir.mkdir(parents=True)
+            older = dict(template); older["result"] = {{"token": TOKEN, "source": "run-999"}}
+            newer = dict(template); newer["result"] = NEWEST
+            (older_dir / "tasks.pkl").write_bytes(pickle.dumps(older))
+            (newer_dir / "tasks.pkl").write_bytes(pickle.dumps(newer))
+            (unrelated_dir / "tasks.pkl").write_bytes(b"(")
+
+            parsl.load(config(run_root))
+            restored = durable(TOKEN)
+            restored_value = restored.result(timeout=10)
+            restored_memo = bool(restored.task_record.get("from_memo"))
+            restored_run = Path(parsl.dfk().run_dir).name
+            close_dfk()
+            emit({{
+                "initial": initial_value,
+                "restored": restored_value,
+                "restored_memo": restored_memo,
+                "restored_run": restored_run,
+                "executions": Path("marker.log").read_text().splitlines(),
+            }})
+            ''',
+        )
+        self.assertEqual(report["initial"], {"token": token, "source": "executed"})
+        self.assertEqual(report["restored"], newest)
+        self.assertTrue(report["restored_memo"])
+        self.assertEqual(report["restored_run"], "1001")
+        self.assertEqual(report["executions"], [token])
 
 def main() -> int:
     global WORKSPACE, TEST_ROOT

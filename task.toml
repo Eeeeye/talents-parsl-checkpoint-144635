@@ -13,12 +13,14 @@ tags = ["debugging", "hpc", "concurrency", "persistence", "recovery", "offline"]
 expert_time_estimate_min = 120.0
 junior_time_estimate_min = 300.0
 difficulty_explanation = """
-L3: the Starter builds and runs but violates one user-visible completion boundary
-across asynchronous Future publication, memo-table state, task-exit and deferred
-checkpoint persistence, and numbered run-directory discovery. A local timing
-workaround or one-line path correction leaves other required modes wrong. A
-complete repair must preserve existing APIs and checkpoint compatibility while
-handling None, exceptions, concurrency, explicit recovery, and corrupt input.
+L3: the Starter builds and runs but violates a user-visible completion boundary
+across Future publication, memo/checkpoint state, terminal task-table cleanup,
+deferred persistence, and numbered run discovery. Success, memo, terminal error,
+dependency, and join paths finalize differently, so patching only the common
+success path leaves observable races. Recovery must also distinguish None from an
+explicit empty checkpoint list, order numeric run IDs, and reject partially
+started pickle records without rejecting a clean EOF. A complete repair therefore
+crosses several asynchronous and persistence layers while preserving public APIs.
 """
 
 [verifier]

@@ -172,7 +172,14 @@ class DataFlowKernel:
         if config.checkpoint_files is not None:
             checkpoint_files = config.checkpoint_files
         elif config.checkpoint_files is None and config.checkpoint_mode is not None:
-            checkpoint_files = get_all_checkpoints(self.config.run_dir)
+            discovered = get_all_checkpoints(self.config.run_dir)
+            checkpoint_files = sorted(
+                (
+                    path for path in discovered
+                    if os.path.basename(os.path.dirname(path)).isdigit()
+                ),
+                key=lambda path: int(os.path.basename(os.path.dirname(path))),
+            )
         else:
             checkpoint_files = []
 
@@ -377,6 +384,7 @@ class DataFlowKernel:
                 task_record['time_returned'] = datetime.datetime.now()
                 self._send_task_log_info(task_record)
                 self._record_task_outcome(task_record, exception=e)
+                self.wipe_task(task_id)
                 with task_record['app_fu']._update_lock:
                     task_record['app_fu'].set_exception(e)
 
@@ -403,6 +411,7 @@ class DataFlowKernel:
                 task_record['time_returned'] = datetime.datetime.now()
                 self._send_task_log_info(task_record)
                 self._record_task_outcome(task_record, exception=e)
+                self.wipe_task(task_id)
                 with task_record['app_fu']._update_lock:
                     task_record['app_fu'].set_exception(e)
 
@@ -453,6 +462,7 @@ class DataFlowKernel:
                         task_record['time_returned'] = datetime.datetime.now()
                         self._send_task_log_info(task_record)
                         self._record_task_outcome(task_record, exception=invalid_join)
+                        self.wipe_task(task_id)
                         with task_record['app_fu']._update_lock:
                             task_record['app_fu'].set_exception(invalid_join)
 
@@ -528,6 +538,7 @@ class DataFlowKernel:
                 self.update_task_state(task_record, States.failed)
                 task_record['time_returned'] = datetime.datetime.now()
                 self._record_task_outcome(task_record, exception=e)
+                self.wipe_task(outer_task_id)
                 with task_record['app_fu']._update_lock:
                     task_record['app_fu'].set_exception(e)
 
@@ -568,7 +579,6 @@ class DataFlowKernel:
         if not task_record['app_fu'] == future:
             logger.error("Internal consistency error: callback future is not the app_fu in task structure, for task {}".format(task_id))
 
-        self.wipe_task(task_id)
         return
 
     def _record_task_outcome(self, task_record: TaskRecord, *, result: Any = None,
@@ -596,6 +606,7 @@ class DataFlowKernel:
         task_record['time_returned'] = datetime.datetime.now()
 
         self._record_task_outcome(task_record, result=result)
+        self.wipe_task(task_record['id'])
         with task_record['app_fu']._update_lock:
             task_record['app_fu'].set_result(result)
 
