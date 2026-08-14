@@ -2,7 +2,7 @@ schema_version = "1.1"
 
 [task]
 name = "talents/parsl-checkpoint-publication"
-description = "Repair completion visibility, immutable deferred checkpoint publication, and collision-safe cross-run recovery in an offline Parsl HPC workflow launcher."
+description = "Repair transactional completion publication, isolated memo snapshots, retryable deferred checkpoints, and collision-safe cross-run recovery in an offline Parsl HPC workflow launcher."
 authors = []
 keywords = ["python", "hpc", "parsl", "workflow", "checkpoint", "concurrency"]
 
@@ -10,8 +10,8 @@ keywords = ["python", "hpc", "parsl", "workflow", "checkpoint", "concurrency"]
 difficulty = "hard"
 category = "systems"
 tags = ["debugging", "hpc", "concurrency", "persistence", "recovery", "offline"]
-expert_time_estimate_min = 120.0
-junior_time_estimate_min = 300.0
+expert_time_estimate_min = 150.0
+junior_time_estimate_min = 360.0
 difficulty_explanation = """
 L3: the Starter builds and runs but violates a user-visible completion boundary
 across Future publication, memo/checkpoint state, terminal task-table cleanup,
@@ -19,11 +19,14 @@ deferred persistence, and numbered run discovery. Success, memo, terminal error,
 dependency, and join paths finalize differently, so patching only the common
 success path leaves observable races. Recovery must also distinguish None from an
 explicit empty checkpoint list, snapshot mutable results before callers can alter
-deferred state, atomically allocate run IDs across launcher processes, distinguish
-ASCII run names from numeric lookalikes, order numeric run IDs, and reject
-partially started pickle records without rejecting a clean EOF or creating empty
-streams for ineligible outcomes. A complete repair therefore crosses several
-asynchronous, filesystem, and persistence layers while preserving public APIs.
+deferred state, isolate each memo hit from mutations to earlier returned values,
+roll back a successful publication when a required task-exit write fails, and
+retain deferred queues across failed flushes without duplicates. It must atomically
+allocate run IDs across launcher processes, distinguish ASCII run names from
+numeric lookalikes, order numeric run IDs, and reject partially started pickle
+records without rejecting a clean EOF or creating empty streams for ineligible
+outcomes. These are independent concurrency, transaction, snapshot, and recovery
+root causes across several modules while preserving public APIs and compatibility.
 """
 
 [verifier]

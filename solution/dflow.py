@@ -30,7 +30,7 @@ from parsl.dataflow.completion import TaskOutcome
 from parsl.dataflow.dependency_resolvers import SHALLOW_DEPENDENCY_RESOLVER
 from parsl.dataflow.errors import DependencyError, JoinError
 from parsl.dataflow.futures import AppFuture
-from parsl.dataflow.memoization import Memoizer
+from parsl.dataflow.memoization import MemoEntry, Memoizer
 from parsl.dataflow.rundirs import make_rundir
 from parsl.dataflow.states import FINAL_FAILURE_STATES, FINAL_STATES, States
 from parsl.dataflow.taskrecord import TaskRecord
@@ -583,22 +583,29 @@ class DataFlowKernel:
 
     def _record_task_outcome(self, task_record: TaskRecord, *, result: Any = None,
                              exception: BaseException | None = None) -> None:
-        self.memoizer.update_memo(task_record, result=result, exception=exception)
-        if (
-            self.checkpoint_mode is None
-            or exception is not None
-            or not isinstance(task_record.get('hashsum'), str)
-        ):
+        if exception is not None:
+            entry = self.memoizer.prepare_failure(task_record, exception)
+            self.memoizer.update_memo(task_record, entry)
             return
 
-        outcome = TaskOutcome(task_record, result=result, exception=exception)
-        if self.checkpoint_mode == 'task_exit':
-            self.checkpoint(outcomes=[outcome])
-        elif self.checkpoint_mode in ('manual', 'periodic', 'dfk_exit'):
-            with self.checkpoint_lock:
-                self.checkpointable_tasks.append(outcome)
-        else:
-            raise InternalConsistencyError(f"Invalid checkpoint mode {self.checkpoint_mode}")
+        entry = self.memoizer.prepare_success(task_record, result)
+        if (
+            self.checkpoint_mode is not None
+            and entry is not None
+            and isinstance(task_record.get('hashsum'), str)
+        ):
+            outcome = TaskOutcome(task_record, entry)
+            if self.checkpoint_mode == 'task_exit':
+                self.checkpoint(outcomes=[outcome])
+            elif self.checkpoint_mode in ('manual', 'periodic', 'dfk_exit'):
+                with self.checkpoint_lock:
+                    self.checkpointable_tasks.append(outcome)
+            else:
+                raise InternalConsistencyError(f"Invalid checkpoint mode {self.checkpoint_mode}")
+
+        # A task-exit write above is part of the success transaction. Only
+        # make the prepared value reachable after that write has committed.
+        self.memoizer.update_memo(task_record, entry)
 
     def _complete_task(self, task_record: TaskRecord, new_state: States, result: Any) -> None:
         """Set a task into a completed state
@@ -607,12 +614,23 @@ class DataFlowKernel:
         assert new_state not in FINAL_FAILURE_STATES
         old_state = task_record['status']
 
-        self.update_task_state(task_record, new_state)
+        try:
+            self._record_task_outcome(task_record, result=result)
+        except BaseException as publication_error:
+            logger.exception(
+                "Task %s could not publish its successful outcome",
+                task_record['id'],
+            )
+            self.update_task_state(task_record, States.failed)
+            task_record['time_returned'] = datetime.datetime.now()
+            self.wipe_task(task_record['id'])
+            with task_record['app_fu']._update_lock:
+                task_record['app_fu'].set_exception(publication_error)
+            return
 
+        self.update_task_state(task_record, new_state)
         logger.info(f"Task {task_record['id']} completed ({old_state.name} -> {new_state.name})")
         task_record['time_returned'] = datetime.datetime.now()
-
-        self._record_task_outcome(task_record, result=result)
         self.wipe_task(task_record['id'])
         with task_record['app_fu']._update_lock:
             task_record['app_fu'].set_result(result)
@@ -1289,6 +1307,45 @@ class DataFlowKernel:
         # should still see it.
         logger.info("DFK cleanup complete")
 
+    def _write_checkpoint_payloads(self, outcomes: Sequence[TaskOutcome]) -> None:
+        """Append one all-or-nothing batch, restoring the old suffix on error."""
+        payloads = [outcome.checkpoint_payload for outcome in outcomes]
+        if not payloads:
+            return
+        assert all(payload is not None for payload in payloads)
+        batch = b''.join(payload for payload in payloads if payload is not None)
+
+        checkpoint_dir = os.path.join(self.run_dir, 'checkpoint')
+        checkpoint_tasks = os.path.join(checkpoint_dir, 'tasks.pkl')
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        file_existed = os.path.isfile(checkpoint_tasks)
+        original_size = os.path.getsize(checkpoint_tasks) if file_existed else 0
+        try:
+            with open(checkpoint_tasks, 'a+b') as stream:
+                stream.seek(0, os.SEEK_END)
+                original_size = stream.tell()
+                written = stream.write(batch)
+                if written != len(batch):
+                    raise OSError("short checkpoint batch write")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            # A retry must begin from the exact previously committed prefix.
+            # This also removes a newly-created empty/partial stream so it
+            # cannot poison automatic recovery.
+            if os.path.isfile(checkpoint_tasks):
+                try:
+                    with open(checkpoint_tasks, 'r+b') as stream:
+                        stream.truncate(original_size)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    if not file_existed and original_size == 0:
+                        os.unlink(checkpoint_tasks)
+                except BaseException:
+                    logger.exception("Failed to roll back checkpoint append")
+            raise
+
     def checkpoint(self, tasks: Optional[Sequence[TaskRecord]] = None,
                    outcomes: Optional[Sequence[TaskOutcome]] = None) -> None:
         """Checkpoint the dfk incrementally to a checkpoint file.
@@ -1309,56 +1366,43 @@ class DataFlowKernel:
             run under RUNDIR/checkpoints/tasks.pkl
         """
         with self.checkpoint_lock:
+            deferred_count = 0
             if outcomes is not None:
-                checkpoint_queue = outcomes
-            elif tasks:
-                checkpoint_queue = [TaskOutcome(task, result=task['app_fu'].result())
-                                    for task in tasks
-                                    if task['app_fu'].done() and task['app_fu'].exception() is None]
+                checkpoint_queue = list(outcomes)
+            elif tasks is not None:
+                checkpoint_queue = []
+                for task in tasks:
+                    app_future = task['app_fu']
+                    if not app_future.done() or app_future.exception() is not None:
+                        continue
+                    entry = self.memoizer.prepare_success(task, app_future.result())
+                    if entry is not None and isinstance(task.get('hashsum'), str):
+                        checkpoint_queue.append(TaskOutcome(task, entry))
             else:
-                checkpoint_queue = self.checkpointable_tasks
-                self.checkpointable_tasks = []
+                checkpoint_queue = list(self.checkpointable_tasks)
+                deferred_count = len(checkpoint_queue)
 
             checkpoint_queue = [
                 outcome for outcome in checkpoint_queue
                 if outcome.succeeded and outcome.checkpoint_payload is not None
             ]
             if not checkpoint_queue:
+                if deferred_count:
+                    del self.checkpointable_tasks[:deferred_count]
                 if self.checkpointed_tasks == 0:
                     logger.warning("No tasks checkpointed so far in this run. Please ensure caching is enabled")
                 else:
                     logger.debug("No tasks checkpointed in this pass.")
                 return
 
-            checkpoint_dir = '{0}/checkpoint'.format(self.run_dir)
-            checkpoint_tasks = checkpoint_dir + '/tasks.pkl'
-
-            if not os.path.exists(checkpoint_dir):
-                os.makedirs(checkpoint_dir, exist_ok=True)
-
-            count = 0
-
-            with open(checkpoint_tasks, 'ab') as f:
-                for outcome in checkpoint_queue:
-                    task_record = outcome.task_record
-                    task_id = task_record['id']
-                    payload = outcome.checkpoint_payload
-                    assert payload is not None
-                    written = f.write(payload)
-                    if written != len(payload):
-                        raise OSError("short checkpoint record write")
-                    count += 1
-                    logger.debug("Task {} checkpointed".format(task_id))
-
+            self._write_checkpoint_payloads(checkpoint_queue)
+            if deferred_count:
+                del self.checkpointable_tasks[:deferred_count]
+            count = len(checkpoint_queue)
+            for outcome in checkpoint_queue:
+                logger.debug("Task {} checkpointed".format(outcome.task_record['id']))
             self.checkpointed_tasks += count
-
-            if count == 0:
-                if self.checkpointed_tasks == 0:
-                    logger.warning("No tasks checkpointed so far in this run. Please ensure caching is enabled")
-                else:
-                    logger.debug("No tasks checkpointed in this pass.")
-            else:
-                logger.info("Done checkpointing {} tasks".format(count))
+            logger.info("Done checkpointing {} tasks".format(count))
 
     @staticmethod
     def _log_std_streams(task_record: TaskRecord) -> None:

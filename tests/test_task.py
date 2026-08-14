@@ -1151,6 +1151,227 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(report["second_run"], "001")
         self.assertEqual(report["executions"], [token])
 
+    def test_18_memo_hits_are_independent_immutable_snapshots(self) -> None:
+        token = secrets.token_hex(14)
+        values = [random.randint(-(2**30), 2**30) for _ in range(8)]
+        label = secrets.token_hex(9)
+        mutation = random.randint(2**31, 2**32 - 1)
+        expected = {
+            "token": token,
+            "payload": {"values": values, "labels": [label, token[:8]]},
+            "meta": {"state": "published"},
+        }
+        report = run_probe(
+            "memo_snapshot_isolation",
+            f'''
+            TOKEN = {token!r}; VALUES = {values!r}; LABEL = {label!r}; MUTATION = {mutation!r}
+
+            class StickyBox:
+                """Pickle-compatible mutable value whose deepcopy preserves identity."""
+                def __init__(self, value):
+                    self.value = value
+
+                def __deepcopy__(self, memo):
+                    return self
+
+            @python_app(cache=True)
+            def mutable_result(token, values, label):
+                import os
+                fd = os.open("marker.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                try: os.write(fd, (token + "\\n").encode()); os.fsync(fd)
+                finally: os.close(fd)
+                return StickyBox({{
+                    "token": token,
+                    "payload": {{"values": list(values), "labels": [label, token[:8]]}},
+                    "meta": {{"state": "published"}},
+                }})
+
+            dfk = parsl.load(config(ROOT / "runinfo", mode="manual", threads=2))
+            first = mutable_result(TOKEN, VALUES, LABEL)
+            first_value = first.result(timeout=10)
+            first_visible = pickle.loads(pickle.dumps(first_value.value))
+            first_value.value["payload"]["values"][0] = MUTATION
+            first_value.value["payload"]["labels"][0] = "first-mutated-" + TOKEN
+            first_value.value["meta"]["state"] = "first-mutated"
+
+            second = mutable_result(TOKEN, VALUES, LABEL)
+            second_value = second.result(timeout=10)
+            second_visible = pickle.loads(pickle.dumps(second_value.value))
+            second_value.value["payload"]["values"].append(MUTATION)
+            second_value.value["payload"]["labels"][1] = "second-mutated-" + TOKEN
+            second_value.value["meta"]["state"] = "second-mutated"
+
+            third = mutable_result(TOKEN, VALUES, LABEL)
+            third_value = third.result(timeout=10)
+            third_visible = pickle.loads(pickle.dumps(third_value.value))
+
+            dfk.checkpoint()
+            checkpoint = Path(dfk.run_dir) / "checkpoint" / "tasks.pkl"
+            records = decode(checkpoint)
+            close_dfk()
+            emit({{
+                "first": first_visible,
+                "second": second_visible,
+                "third": third_visible,
+                "first_memo": bool(first.task_record.get("from_memo")),
+                "second_memo": bool(second.task_record.get("from_memo")),
+                "third_memo": bool(third.task_record.get("from_memo")),
+                "records": [record["result"].value for record in records],
+                "executions": Path("marker.log").read_text().splitlines(),
+            }})
+            ''',
+        )
+        self.assertEqual(report["first"], expected)
+        self.assertEqual(report["second"], expected)
+        self.assertEqual(report["third"], expected)
+        self.assertFalse(report["first_memo"])
+        self.assertTrue(report["second_memo"])
+        self.assertTrue(report["third_memo"])
+        self.assertGreaterEqual(len(report["records"]), 1)
+        self.assertTrue(all(record == expected for record in report["records"]))
+        self.assertEqual(report["executions"], [token])
+
+    def test_19_task_exit_persistence_failure_rolls_back_publication(self) -> None:
+        token = secrets.token_hex(14)
+        value = {
+            "token": token,
+            "values": [random.randint(-(2**30), 2**30) for _ in range(7)],
+        }
+        report = run_probe(
+            "task_exit_transaction",
+            f'''
+            TOKEN = {token!r}; VALUE = {value!r}
+
+            @python_app(cache=True)
+            def durable(token, value):
+                import os
+                fd = os.open("marker.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                try: os.write(fd, (token + "\\n").encode()); os.fsync(fd)
+                finally: os.close(fd)
+                return value
+
+            dfk = parsl.load(config(ROOT / "runinfo", mode="task_exit", threads=2))
+            blocker = Path(dfk.run_dir) / "checkpoint"
+            blocker.write_bytes(("blocked-" + TOKEN).encode())
+
+            first = durable(TOKEN, VALUE)
+            try:
+                first.result(timeout=5)
+            except BaseException as exc:
+                first_error = type(exc).__name__
+            else:
+                first_error = "NO_ERROR"
+            first_done = first.done()
+            first_present = first.tid in dfk.tasks
+            blocker_unchanged = blocker.read_bytes() == ("blocked-" + TOKEN).encode()
+
+            blocker.unlink()
+            second = durable(TOKEN, VALUE)
+            second_value = second.result(timeout=10)
+            second_memo = bool(second.task_record.get("from_memo"))
+            third = durable(TOKEN, VALUE)
+            third_value = third.result(timeout=10)
+            third_memo = bool(third.task_record.get("from_memo"))
+            checkpoint = Path(dfk.run_dir) / "checkpoint" / "tasks.pkl"
+            records = decode(checkpoint)
+            close_dfk()
+            emit({{
+                "first_error": first_error,
+                "first_done": first_done,
+                "first_present": first_present,
+                "blocker_unchanged": blocker_unchanged,
+                "second": second_value,
+                "second_memo": second_memo,
+                "third": third_value,
+                "third_memo": third_memo,
+                "records": [record["result"] for record in records],
+                "executions": Path("marker.log").read_text().splitlines(),
+            }})
+            ''',
+        )
+        self.assertNotIn(report["first_error"], ("NO_ERROR", "TimeoutError"))
+        self.assertTrue(report["first_done"])
+        self.assertFalse(report["first_present"])
+        self.assertTrue(report["blocker_unchanged"])
+        self.assertEqual(report["second"], value)
+        self.assertFalse(report["second_memo"])
+        self.assertEqual(report["third"], value)
+        self.assertTrue(report["third_memo"])
+        self.assertGreaterEqual(len(report["records"]), 1)
+        self.assertTrue(all(record == value for record in report["records"]))
+        self.assertEqual(report["executions"], [token, token])
+
+    def test_20_deferred_flush_failure_retains_every_outcome(self) -> None:
+        tokens = {
+            mode: [secrets.token_hex(10) for _ in range(4)]
+            for mode in ("manual", "periodic", "dfk_exit")
+        }
+        report = run_probe(
+            "deferred_flush_retry",
+            f'''
+            TOKENS = {tokens!r}
+
+            @python_app(cache=True)
+            def compute(mode, index, token):
+                return {{"mode": mode, "index": index, "token": token}}
+
+            reports = {{}}
+            for mode in ("manual", "periodic", "dfk_exit"):
+                period = "01:00:00" if mode == "periodic" else None
+                dfk = parsl.load(config(
+                    ROOT / ("runs-" + mode), mode=mode, threads=4, period=period
+                ))
+                blocker = Path(dfk.run_dir) / "checkpoint"
+                blocker_payload = ("blocked-" + mode).encode()
+                blocker.write_bytes(blocker_payload)
+                values = [
+                    compute(mode, index, token).result(timeout=10)
+                    for index, token in enumerate(TOKENS[mode])
+                ]
+
+                try:
+                    dfk.checkpoint()
+                except BaseException as exc:
+                    failure = type(exc).__name__
+                else:
+                    failure = "NO_ERROR"
+                blocker_unchanged = blocker.read_bytes() == blocker_payload
+                blocker.unlink()
+
+                dfk.checkpoint()
+                checkpoint = Path(dfk.run_dir) / "checkpoint" / "tasks.pkl"
+                after_retry = decode(checkpoint)
+                dfk.checkpoint()
+                after_second_flush = decode(checkpoint)
+                close_dfk()
+                after_cleanup = decode(checkpoint)
+                reports[mode] = {{
+                    "failure": failure,
+                    "blocker_unchanged": blocker_unchanged,
+                    "values": values,
+                    "after_retry": [record["result"] for record in after_retry],
+                    "after_second_flush": [record["result"] for record in after_second_flush],
+                    "after_cleanup": [record["result"] for record in after_cleanup],
+                }}
+            emit(reports)
+            ''',
+            timeout=50,
+        )
+        for mode in ("manual", "periodic", "dfk_exit"):
+            expected = [
+                {"mode": mode, "index": index, "token": token}
+                for index, token in enumerate(tokens[mode])
+            ]
+            self.assertNotEqual(report[mode]["failure"], "NO_ERROR", mode)
+            self.assertTrue(report[mode]["blocker_unchanged"], mode)
+            self.assertEqual(report[mode]["values"], expected, mode)
+            self.assertCountEqual(report[mode]["after_retry"], expected, mode)
+            self.assertCountEqual(report[mode]["after_second_flush"], expected, mode)
+            self.assertCountEqual(report[mode]["after_cleanup"], expected, mode)
+            self.assertEqual(len(report[mode]["after_retry"]), len(expected), mode)
+            self.assertEqual(len(report[mode]["after_second_flush"]), len(expected), mode)
+            self.assertEqual(len(report[mode]["after_cleanup"]), len(expected), mode)
+
 def main() -> int:
     global WORKSPACE, TEST_ROOT
     inherited_fd = os.environ.pop("PARSL_VERIFIER_FD", "")

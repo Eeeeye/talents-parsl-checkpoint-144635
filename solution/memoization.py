@@ -5,7 +5,9 @@ import logging
 import os
 import pickle
 import types
+from copy import deepcopy
 from concurrent.futures import Future
+from dataclasses import dataclass
 from functools import lru_cache, singledispatch
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -15,6 +17,50 @@ from parsl.dataflow.errors import BadCheckpoint
 from parsl.dataflow.taskrecord import TaskRecord
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MemoEntry:
+    """An isolated memo snapshot which materializes a fresh value per hit."""
+
+    payload: bytes | None = None
+    fallback: Any = None
+    exception: BaseException | None = None
+
+    @classmethod
+    def from_result(cls, result: Any) -> MemoEntry:
+        try:
+            payload = pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:
+            # App caching historically accepted some values which cannot be
+            # pickled. Preserve that behavior where possible while giving
+            # pickle-compatible values the stronger isolation guarantee.
+            try:
+                fallback = deepcopy(result)
+            except Exception:
+                fallback = result
+            return cls(fallback=fallback)
+        return cls(payload=payload)
+
+    @classmethod
+    def from_exception(cls, exception: BaseException) -> MemoEntry:
+        return cls(exception=exception)
+
+    def materialize(self) -> Any:
+        if self.payload is not None:
+            return pickle.loads(self.payload)
+        try:
+            return deepcopy(self.fallback)
+        except Exception:
+            return self.fallback
+
+    def as_future(self) -> Future[Any]:
+        future: Future[Any] = Future()
+        if self.exception is not None:
+            future.set_exception(self.exception)
+        else:
+            future.set_result(self.materialize())
+        return future
 
 
 @singledispatch
@@ -222,9 +268,9 @@ class Memoizer:
 
         hashsum = self.make_hash(task)
         logger.debug("Task {} has memoization hash {}".format(task_id, hashsum))
-        result = None
+        result: Optional[Future[Any]] = None
         if hashsum in self.memo_lookup_table:
-            result = self.memo_lookup_table[hashsum]
+            result = self.memo_lookup_table[hashsum].as_future()
             logger.info("Task %s using result from cache", task_id)
         else:
             logger.info("Task %s had no result in cache", task_id)
@@ -234,36 +280,52 @@ class Memoizer:
         assert isinstance(result, Future) or result is None
         return result
 
-    def update_memo(self, task: TaskRecord, *, result: Any = None,
-                    exception: BaseException | None = None) -> None:
-        """Updates the memoization lookup table with the result from a task.
-        This doesn't move any values around but associates the memoization
-        hashsum with the completed (by success or failure) AppFuture.
+    def _eligible_hash(self, task: TaskRecord) -> Optional[str]:
+        if not self.memoize or not task['memoize']:
+            return None
+        hashsum = task.get('hashsum')
+        if not isinstance(hashsum, str):
+            logger.error("Attempting to update app cache entry but hashsum is not a string key")
+            return None
+        return hashsum
+
+    def prepare_success(self, task: TaskRecord, result: Any) -> Optional[MemoEntry]:
+        """Freeze a successful result without publishing it into the table."""
+        if self._eligible_hash(task) is None:
+            return None
+        return MemoEntry.from_result(result)
+
+    def prepare_failure(self, task: TaskRecord,
+                        exception: BaseException) -> Optional[MemoEntry]:
+        """Prepare the existing failure-caching behavior for publication."""
+        if self._eligible_hash(task) is None:
+            return None
+        return MemoEntry.from_exception(exception)
+
+    def update_memo(self, task: TaskRecord, entry: Optional[MemoEntry]) -> None:
+        """Publish a previously prepared memo entry.
+
+        Preparation is separate so required persistence can succeed before a
+        successful value becomes reachable through memoization.
 
         Args:
              - task (TaskRecord) : A task record from dfk.tasks
         """
         task_id = task['id']
 
-        if not self.memoize or not task['memoize'] or 'hashsum' not in task:
+        if entry is None:
+            return
+        hashsum = self._eligible_hash(task)
+        if hashsum is None:
             return
 
-        if not isinstance(task['hashsum'], str):
-            logger.error("Attempting to update app cache entry but hashsum is not a string key")
-            return
-
-        if task['hashsum'] in self.memo_lookup_table:
-            logger.info(f"Replacing app cache entry {task['hashsum']} with result from task {task_id}")
+        if hashsum in self.memo_lookup_table:
+            logger.info(f"Replacing app cache entry {hashsum} with result from task {task_id}")
         else:
-            logger.debug(f"Storing app cache entry {task['hashsum']} with result from task {task_id}")
-        completed: Future[Any] = Future()
-        if exception is None:
-            completed.set_result(result)
-        else:
-            completed.set_exception(exception)
-        self.memo_lookup_table[task['hashsum']] = completed
+            logger.debug(f"Storing app cache entry {hashsum} with result from task {task_id}")
+        self.memo_lookup_table[hashsum] = entry
 
-    def _load_checkpoints(self, checkpointDirs: Sequence[str]) -> Dict[str, Future[Any]]:
+    def _load_checkpoints(self, checkpointDirs: Sequence[str]) -> Dict[str, MemoEntry]:
         """Load a checkpoint file into a lookup table.
 
         The data being loaded from the pickle file mostly contains input
@@ -295,10 +357,7 @@ class Memoizer:
                             raise ValueError("invalid checkpoint record schema")
                         if not isinstance(data["hash"], str) or data["exception"] is not None:
                             raise ValueError("invalid checkpoint record values")
-                        # Copy and hash only the input attributes
-                        memo_fu: Future = Future()
-                        memo_fu.set_result(data['result'])
-                        memo_lookup_table[data['hash']] = memo_fu
+                        memo_lookup_table[data['hash']] = MemoEntry.from_result(data['result'])
             except FileNotFoundError:
                 reason = "Checkpoint file was not found: {}".format(
                     checkpoint_file)
@@ -315,7 +374,7 @@ class Memoizer:
         return memo_lookup_table
 
     @typeguard.typechecked
-    def load_checkpoints(self, checkpointDirs: Optional[Sequence[str]]) -> Dict[str, Future]:
+    def load_checkpoints(self, checkpointDirs: Optional[Sequence[str]]) -> Dict[str, MemoEntry]:
         """Load checkpoints from the checkpoint files into a dictionary.
 
         The results are used to pre-populate the memoizer's lookup_table

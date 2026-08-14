@@ -29,6 +29,11 @@ The publication-boundary report shows a completed first Future while the
 cached task once in each of two numbered run directories instead of recovering
 the result written by the first process.
 
+The same ordering also exposes two failure-boundary symptoms: memo hits can share
+mutable result state with earlier callers, and a filesystem error during a
+required or deferred checkpoint can either leave a successful Future without its
+durable record or discard completed work before a later retry.
+
 The saved, path-redacted output is in `incident/original-output.log`.
 
 ## Required final behavior
@@ -41,13 +46,25 @@ below must retain their existing signatures and meanings.
    call made immediately after `future.result()` returns must reuse that result,
    must set `task_record["from_memo"]` to true, and must not execute the app body
    again. This must hold for ordinary Python values, nested containers, and a
-   legitimate result of `None`.
+   legitimate result of `None`. For every pickle-compatible mutable result, the
+   value published by the first successful execution is also the immutable cache
+   snapshot: mutating the executed result after `future.result()` returns must not
+   change a later memo hit. Each memo hit must materialize an independent value,
+   so mutating one memo-hit result must not change any subsequent memo hit or any
+   checkpoint record derived from the original successful publication.
 
 2. **`task_exit` checkpoints are visible at completion.** With
    `checkpoint_mode="task_exit"`, before a successful cached app Future becomes
    observable as done, its run-specific
    `<dfk.run_dir>/checkpoint/tasks.pkl` file must contain the successful record.
    Code that calls `future.result()` and immediately opens that file must succeed.
+   Persistence is part of the success transaction: if the required checkpoint
+   record cannot be written, the Future must promptly finish with the persistence
+   failure instead of hanging or reporting the app result. With default garbage
+   collection its task must already be absent from `dfk.tasks`, and the attempted
+   success must not be installed in memoization. After the filesystem problem is
+   repaired, an identical invocation must execute the app body again and may then
+   publish and memoize a successful result.
 
 3. **Terminal Futures expose fully finalized tasks.** With the default
    `Config.garbage_collect=True`, a task ID must no longer be present in
@@ -68,7 +85,11 @@ below must retain their existing signatures and meanings.
    or lose completed records. The queued record is a snapshot of the result at
    the completion publication boundary: mutating a list, dictionary, or nested
    value returned by `future.result()` must not change bytes written later by a
-   deferred checkpoint.
+   deferred checkpoint. If a flush in any deferred mode fails, every not-yet-
+   written outcome must remain pending in that DFK. Once the blocking filesystem
+   condition is repaired, an explicit retry must write all of those outcomes
+   exactly once; a failed attempt must not silently discard them or cause
+   duplicates on the retry, a later flush, or normal cleanup.
 
 5. **Automatic recovery spans numbered runs.** If `checkpoint_files` is omitted
    and checkpointing is enabled, a new DFK must discover valid checkpoints under
@@ -127,7 +148,8 @@ repaired implementation.
 The ordering among independent task records is unspecified. For a given completed
 task, however, the memoized result, any required `task_exit` record, final task
 state, and default task-table cleanup must be published before its user-facing
-Future is published.
+Future is published. If the required `task_exit` record cannot be published, the
+memoized success and successful Future publication must both be rolled back.
 
 ## Allowed changes
 
@@ -164,5 +186,7 @@ records, run-directory locations, exceptions, and artifact hashes. It covers
 immediate duplicate submission, `None`, nested values, automatic and explicit
 recovery (including an explicit empty list), numeric run ordering, deferred
 modes, concurrent completion, terminal task cleanup across success/failure/join
-paths, deferred-result mutation, concurrent run-directory allocation, malformed
-checkpoints, ineligible empty-stream suppression, and repeat execution.
+paths, mutation of both executed and memo-hit values, transactional `task_exit`
+write failure and retry, deferred flush failure and retry in all three deferred
+modes, concurrent run-directory allocation, malformed checkpoints, ineligible
+empty-stream suppression, and repeat execution.
