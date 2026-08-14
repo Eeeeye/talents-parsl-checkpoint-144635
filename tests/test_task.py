@@ -132,7 +132,7 @@ if _probe_fd:
     os.close(int(_probe_fd))
 
 import parsl
-from parsl.app.app import python_app
+from parsl.app.app import join_app, python_app
 from parsl.config import Config
 from parsl.dataflow.errors import BadCheckpoint
 from parsl.executors.threads import ThreadPoolExecutor
@@ -580,7 +580,44 @@ class TaskTests(unittest.TestCase):
         self.assertIn(expected, report["records"])
         self.assertEqual(report["attempts"], [token, token])
 
-    def test_10_invalid_checkpoints_fail_closed_and_remain_unchanged(self) -> None:
+    def test_10_join_app_preserves_inner_result_and_checkpoint(self) -> None:
+        token = secrets.token_hex(13)
+        report = run_probe(
+            "join_behavior",
+            f'''
+            TOKEN = {token!r}
+
+            @python_app(cache=True)
+            def inner(token):
+                import os
+                fd = os.open("join-marker.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                try: os.write(fd, (token + "\\n").encode()); os.fsync(fd)
+                finally: os.close(fd)
+                return {{"token": token, "length": len(token)}}
+
+            @join_app
+            def outer(token):
+                return inner(token)
+
+            parsl.load(config(ROOT / "runinfo"))
+            first = outer(TOKEN); first_value = first.result(timeout=10)
+            second = inner(TOKEN); second_value = second.result(timeout=10)
+            checkpoint = Path(parsl.dfk().run_dir) / "checkpoint" / "tasks.pkl"
+            records = decode(checkpoint); close_dfk()
+            emit({{"first": first_value, "second": second_value,
+                  "second_memo": bool(second.task_record.get("from_memo")),
+                  "records": [r["result"] for r in records],
+                  "executions": Path("join-marker.log").read_text().splitlines()}})
+            ''',
+        )
+        expected = {"token": token, "length": len(token)}
+        self.assertEqual(report["first"], expected)
+        self.assertEqual(report["second"], expected)
+        self.assertTrue(report["second_memo"])
+        self.assertIn(expected, report["records"])
+        self.assertEqual(report["executions"], [token])
+
+    def test_11_invalid_checkpoints_fail_closed_and_remain_unchanged(self) -> None:
         report = run_probe(
             "invalid_checkpoints",
             r'''

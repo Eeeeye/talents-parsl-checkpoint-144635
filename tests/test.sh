@@ -43,7 +43,7 @@ trap 'exit_code=$?; if (( exit_code != 0 )); then write_reward 0; fi' EXIT
 
 exec 3< /tests/test_task.py
 actual_verifier="$(sha256sum /proc/self/fd/3 | awk '{print $1}')"
-expected_verifier="1028f9e7e5cfe181be1bbb82e78a09de4e63e9e81533b657b177386c908673f8"
+expected_verifier="dd3d3ccba86e8150c5b28d478c285bca685f66df38f837946aaa6785decb0147"
 declared_verifier="$(awk 'NF == 2 && $2 == "test_task.py" {print $1}' /tests/verifier.sha256)"
 if [[ "${declared_verifier}" != "${expected_verifier}" || "${actual_verifier}" != "${expected_verifier}" ]]; then
     echo "trusted verifier digest mismatch" >&2
