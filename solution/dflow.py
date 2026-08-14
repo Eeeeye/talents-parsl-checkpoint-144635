@@ -6,7 +6,6 @@ import datetime
 import inspect
 import logging
 import os
-import pickle
 import random
 import sys
 import threading
@@ -173,13 +172,14 @@ class DataFlowKernel:
             checkpoint_files = config.checkpoint_files
         elif config.checkpoint_files is None and config.checkpoint_mode is not None:
             discovered = get_all_checkpoints(self.config.run_dir)
-            checkpoint_files = sorted(
-                (
-                    path for path in discovered
-                    if os.path.basename(os.path.dirname(path)).isdigit()
-                ),
-                key=lambda path: int(os.path.basename(os.path.dirname(path))),
-            )
+            numbered_checkpoints = []
+            for path in discovered:
+                run_name = os.path.basename(os.path.dirname(path))
+                if run_name.isascii() and run_name.isdecimal():
+                    numbered_checkpoints.append((int(run_name), path))
+            checkpoint_files = [
+                path for _, path in sorted(numbered_checkpoints, key=lambda item: item[0])
+            ]
         else:
             checkpoint_files = []
 
@@ -187,7 +187,7 @@ class DataFlowKernel:
         self.checkpointed_tasks = 0
         self._checkpoint_timer = None
         self.checkpoint_mode = config.checkpoint_mode
-        self.checkpointable_tasks: List[TaskRecord] = []
+        self.checkpointable_tasks: List[TaskOutcome] = []
 
         # this must be set before executors are added since add_executors calls
         # job_status_poller.add_executors.
@@ -583,14 +583,21 @@ class DataFlowKernel:
 
     def _record_task_outcome(self, task_record: TaskRecord, *, result: Any = None,
                              exception: BaseException | None = None) -> None:
-        outcome = TaskOutcome(task_record, result=result, exception=exception)
         self.memoizer.update_memo(task_record, result=result, exception=exception)
+        if (
+            self.checkpoint_mode is None
+            or exception is not None
+            or not isinstance(task_record.get('hashsum'), str)
+        ):
+            return
+
+        outcome = TaskOutcome(task_record, result=result, exception=exception)
         if self.checkpoint_mode == 'task_exit':
             self.checkpoint(outcomes=[outcome])
         elif self.checkpoint_mode in ('manual', 'periodic', 'dfk_exit'):
             with self.checkpoint_lock:
                 self.checkpointable_tasks.append(outcome)
-        elif self.checkpoint_mode is not None:
+        else:
             raise InternalConsistencyError(f"Invalid checkpoint mode {self.checkpoint_mode}")
 
     def _complete_task(self, task_record: TaskRecord, new_state: States, result: Any) -> None:
@@ -1312,6 +1319,17 @@ class DataFlowKernel:
                 checkpoint_queue = self.checkpointable_tasks
                 self.checkpointable_tasks = []
 
+            checkpoint_queue = [
+                outcome for outcome in checkpoint_queue
+                if outcome.succeeded and outcome.checkpoint_payload is not None
+            ]
+            if not checkpoint_queue:
+                if self.checkpointed_tasks == 0:
+                    logger.warning("No tasks checkpointed so far in this run. Please ensure caching is enabled")
+                else:
+                    logger.debug("No tasks checkpointed in this pass.")
+                return
+
             checkpoint_dir = '{0}/checkpoint'.format(self.run_dir)
             checkpoint_tasks = checkpoint_dir + '/tasks.pkl'
 
@@ -1324,17 +1342,13 @@ class DataFlowKernel:
                 for outcome in checkpoint_queue:
                     task_record = outcome.task_record
                     task_id = task_record['id']
-                    if outcome.succeeded:
-                        hashsum = task_record['hashsum']
-                        if not hashsum:
-                            continue
-                        t = {'hash': hashsum, 'exception': None, 'result': outcome.result}
-
-                        # We are using pickle here since pickle dumps to a file in 'ab'
-                        # mode behave like a incremental log.
-                        pickle.dump(t, f)
-                        count += 1
-                        logger.debug("Task {} checkpointed".format(task_id))
+                    payload = outcome.checkpoint_payload
+                    assert payload is not None
+                    written = f.write(payload)
+                    if written != len(payload):
+                        raise OSError("short checkpoint record write")
+                    count += 1
+                    logger.debug("Task {} checkpointed".format(task_id))
 
             self.checkpointed_tasks += count
 

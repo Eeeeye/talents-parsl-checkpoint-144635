@@ -65,18 +65,25 @@ below must retain their existing signatures and meanings.
    the file need not exist before cleanup, but it must contain all queued successes
    when cleanup returns. Concurrent task completion and a concurrent manual
    checkpoint call must not corrupt the pickle stream, duplicate a queued record,
-   or lose completed records.
+   or lose completed records. The queued record is a snapshot of the result at
+   the completion publication boundary: mutating a list, dictionary, or nested
+   value returned by `future.result()` must not change bytes written later by a
+   deferred checkpoint.
 
 5. **Automatic recovery spans numbered runs.** If `checkpoint_files` is omitted
    and checkpointing is enabled, a new DFK must discover valid checkpoints under
-   previous numbered run directories of `Config.run_dir`. Only all-decimal run
-   directory names participate; unrelated directories below the run root must be
-   ignored even if they contain a `checkpoint/tasks.pkl` path. Runs are ordered by
-   numeric run ID, not lexicographically, so if later records repeat a hash the
-   newest numbered run wins. The implementation must not search only the newly
-   created per-run directory. The first invocation in a fresh run root executes
-   normally; the same cached invocation in a second Parsl process must load the
-   previous result, set `from_memo` to true, and not execute the app body.
+   previous numbered run directories of `Config.run_dir`. Only names composed
+   entirely of ASCII digits `0` through `9` participate. Names with a numeric
+   prefix or suffix and Unicode decimal-looking names are unrelated directories
+   and must be ignored even if they contain a `checkpoint/tasks.pkl` path. Runs
+   are ordered by numeric run ID, not lexicographically, so if later records
+   repeat a hash the newest numbered run wins. The implementation must not search
+   only the newly created per-run directory. The first invocation in a fresh run
+   root executes normally; the same cached invocation in a second Parsl process
+   must load the previous result, set `from_memo` to true, and not execute the app
+   body. Multiple DFK launcher processes starting against the same
+   `Config.run_dir` must atomically allocate distinct numbered run directories;
+   an existing directory or other entry must never be reused or overwritten.
 
 6. **Explicit recovery remains supported.** Whenever
    `Config.checkpoint_files` is not `None`, that explicit list is authoritative.
@@ -89,7 +96,9 @@ below must retain their existing signatures and meanings.
    its original exception behavior. It must not be emitted as a successful
    `{hash, exception, result}` checkpoint record and a later identical call must
    not return a fabricated successful value. Existing retry and join behavior must
-   remain intact.
+   remain intact. A run containing only failed tasks or successes whose app cache
+   is disabled must not create an empty `tasks.pkl`; such an empty artifact would
+   poison otherwise valid automatic recovery in the next DFK process.
 
 8. **Invalid checkpoints fail closed.** A requested checkpoint that is missing,
    empty, truncated, not a pickle stream of records, or has an invalid record
@@ -155,4 +164,5 @@ records, run-directory locations, exceptions, and artifact hashes. It covers
 immediate duplicate submission, `None`, nested values, automatic and explicit
 recovery (including an explicit empty list), numeric run ordering, deferred
 modes, concurrent completion, terminal task cleanup across success/failure/join
-paths, malformed checkpoints, and repeat execution.
+paths, deferred-result mutation, concurrent run-directory allocation, malformed
+checkpoints, ineligible empty-stream suppression, and repeat execution.

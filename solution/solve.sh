@@ -7,7 +7,8 @@ solution_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 for relative in \
     parsl/dataflow/dflow.py \
     parsl/dataflow/memoization.py \
-    parsl/dataflow/completion.py
+    parsl/dataflow/completion.py \
+    parsl/dataflow/rundirs.py
 do
     source_path="${solution_root}/$(basename "${relative}")"
     destination="${workspace}/${relative}"

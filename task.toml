@@ -2,7 +2,7 @@ schema_version = "1.1"
 
 [task]
 name = "talents/parsl-checkpoint-publication"
-description = "Repair completion visibility, memoization publication, deferred checkpointing, and cross-run recovery in an offline Parsl HPC workflow launcher."
+description = "Repair completion visibility, immutable deferred checkpoint publication, and collision-safe cross-run recovery in an offline Parsl HPC workflow launcher."
 authors = []
 keywords = ["python", "hpc", "parsl", "workflow", "checkpoint", "concurrency"]
 
@@ -18,9 +18,12 @@ across Future publication, memo/checkpoint state, terminal task-table cleanup,
 deferred persistence, and numbered run discovery. Success, memo, terminal error,
 dependency, and join paths finalize differently, so patching only the common
 success path leaves observable races. Recovery must also distinguish None from an
-explicit empty checkpoint list, order numeric run IDs, and reject partially
-started pickle records without rejecting a clean EOF. A complete repair therefore
-crosses several asynchronous and persistence layers while preserving public APIs.
+explicit empty checkpoint list, snapshot mutable results before callers can alter
+deferred state, atomically allocate run IDs across launcher processes, distinguish
+ASCII run names from numeric lookalikes, order numeric run IDs, and reject
+partially started pickle records without rejecting a clean EOF or creating empty
+streams for ineligible outcomes. A complete repair therefore crosses several
+asynchronous, filesystem, and persistence layers while preserving public APIs.
 """
 
 [verifier]

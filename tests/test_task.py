@@ -936,6 +936,221 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(report["restored_run"], "1001")
         self.assertEqual(report["executions"], [token])
 
+    def test_15_deferred_checkpoint_snapshots_mutable_results(self) -> None:
+        token = secrets.token_hex(14)
+        values = [random.randint(-(2**30), 2**30) for _ in range(9)]
+        label = secrets.token_hex(10)
+        mutation = random.randint(2**31, 2**32 - 1)
+        expected = {
+            "token": token,
+            "payload": {"values": values, "labels": [label, token[:9]]},
+            "meta": {"state": "published"},
+        }
+        report = run_probe(
+            "deferred_snapshot",
+            f'''
+            TOKEN = {token!r}; VALUES = {values!r}; LABEL = {label!r}; MUTATION = {mutation!r}
+
+            @python_app(cache=True)
+            def mutable_result(token, values, label):
+                return {{
+                    "token": token,
+                    "payload": {{"values": list(values), "labels": [label, token[:9]]}},
+                    "meta": {{"state": "published"}},
+                }}
+
+            reports = {{}}
+            for mode in ("manual", "dfk_exit"):
+                dfk = parsl.load(config(ROOT / ("runs-" + mode), mode=mode, threads=2))
+                future = mutable_result(TOKEN, VALUES, LABEL)
+                result = future.result(timeout=10)
+                visible = json.loads(json.dumps(result, sort_keys=True))
+
+                result["payload"]["values"][0] = MUTATION
+                result["payload"]["values"].append(MUTATION)
+                result["payload"]["labels"][0] = "mutated-" + TOKEN
+                result["meta"]["state"] = "mutated"
+                result["added_after_publication"] = True
+
+                checkpoint = Path(dfk.run_dir) / "checkpoint" / "tasks.pkl"
+                if mode == "manual":
+                    dfk.checkpoint()
+                close_dfk()
+                records = decode(checkpoint)
+                reports[mode] = {{
+                    "visible": visible,
+                    "records": [record["result"] for record in records],
+                }}
+            emit(reports)
+            ''',
+        )
+        for mode in ("manual", "dfk_exit"):
+            self.assertEqual(report[mode]["visible"], expected, mode)
+            self.assertEqual(report[mode]["records"], [expected], mode)
+
+    def test_16_concurrent_run_allocation_ignores_numeric_lookalikes(self) -> None:
+        token = secrets.token_hex(13)
+        worker_count = 6
+        report = run_probe(
+            "concurrent_run_allocation",
+            f'''
+            TOKEN = {token!r}; WORKER_COUNT = {worker_count}
+            run_root = ROOT / "shared-runinfo"
+            lookalike_names = ("7x8", "\u0661\u0662\u0663")
+            for name in lookalike_names:
+                checkpoint = run_root / name / "checkpoint"
+                checkpoint.mkdir(parents=True)
+                (checkpoint / "tasks.pkl").write_bytes(b"(")
+
+            ready = ROOT / "allocator-ready"
+            ready.mkdir()
+            gate = ROOT / "allocator-go"
+            worker = ROOT / "allocator_worker.py"
+            worker.write_text(
+                "import json, os, sys, time\\n"
+                "from pathlib import Path\\n"
+                "import parsl\\n"
+                "from parsl.config import Config\\n"
+                "from parsl.executors.threads import ThreadPoolExecutor\\n"
+                "root=Path(sys.argv[1]); run_root=Path(sys.argv[2]); gate=Path(sys.argv[3])\\n"
+                "(root/'allocator-ready'/str(os.getpid())).write_text('ready')\\n"
+                "deadline=time.monotonic()+15\\n"
+                "while not gate.exists():\\n"
+                "  if time.monotonic() >= deadline: raise RuntimeError('allocator gate timeout')\\n"
+                "  time.sleep(0.005)\\n"
+                "dfk=parsl.load(Config(executors=[ThreadPoolExecutor(max_threads=1,label='local')], run_dir=str(run_root), initialize_logging=False, usage_tracking=0, strategy='none'))\\n"
+                "name=Path(dfk.run_dir).name\\n"
+                "dfk.cleanup(); parsl.clear()\\n"
+                "print(json.dumps({{'name':name}},sort_keys=True))\\n",
+                encoding="utf-8",
+            )
+
+            processes = [
+                subprocess.Popen(
+                    [sys.executable, "-B", str(worker), str(ROOT), str(run_root), str(gate)],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                for _ in range(WORKER_COUNT)
+            ]
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if len(list(ready.iterdir())) == WORKER_COUNT:
+                    break
+                time.sleep(0.01)
+            if len(list(ready.iterdir())) != WORKER_COUNT:
+                raise RuntimeError("not all allocator workers became ready")
+            gate.write_text("go", encoding="ascii")
+
+            allocated = []
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=25)
+                if process.returncode != 0:
+                    raise RuntimeError("allocator worker failed: " + stderr)
+                allocated.append(json.loads(stdout.splitlines()[-1])["name"])
+
+            @python_app(cache=True)
+            def identity(token):
+                return {{"token": token, "length": len(token)}}
+
+            dfk = parsl.load(config(run_root, mode="task_exit", threads=2))
+            value = identity(TOKEN).result(timeout=10)
+            next_run = Path(dfk.run_dir).name
+            close_dfk()
+            lookalikes_unchanged = all(
+                (run_root / name / "checkpoint" / "tasks.pkl").read_bytes() == b"("
+                for name in lookalike_names
+            )
+            emit({{
+                "allocated": allocated,
+                "next_run": next_run,
+                "value": value,
+                "lookalikes_unchanged": lookalikes_unchanged,
+            }})
+            ''',
+            timeout=60,
+        )
+        self.assertEqual(len(report["allocated"]), worker_count)
+        self.assertEqual(len(set(report["allocated"])), worker_count)
+        self.assertEqual(
+            set(report["allocated"]),
+            {f"{index:03d}" for index in range(worker_count)},
+        )
+        self.assertTrue(all(name.isascii() and name.isdecimal() for name in report["allocated"]))
+        self.assertEqual(report["next_run"], f"{worker_count:03d}")
+        self.assertEqual(report["value"], {"token": token, "length": len(token)})
+        self.assertTrue(report["lookalikes_unchanged"])
+
+    def test_17_ineligible_outcomes_do_not_poison_next_run(self) -> None:
+        token = secrets.token_hex(14)
+        value = {"token": token, "nonce": random.randint(1, 2**31 - 1)}
+        report = run_probe(
+            "ineligible_checkpoint_outcomes",
+            f'''
+            TOKEN = {token!r}; VALUE = {value!r}
+
+            @python_app(cache=False)
+            def uncached_success(token, value):
+                return value
+
+            @python_app(cache=True)
+            def terminal_failure(token):
+                raise RuntimeError("terminal-" + token)
+
+            run_root = ROOT / "runinfo"
+            first_dfk = parsl.load(config(run_root, mode="task_exit", threads=3))
+            first_value = uncached_success(TOKEN, VALUE).result(timeout=10)
+            failed = terminal_failure(TOKEN)
+            try:
+                failed.result(timeout=10)
+            except RuntimeError as exc:
+                failure_message = str(exc)
+            else:
+                failure_message = "NO_ERROR"
+            first_run = Path(first_dfk.run_dir).name
+            first_checkpoint = Path(first_dfk.run_dir) / "checkpoint" / "tasks.pkl"
+            before_cleanup = first_checkpoint.exists()
+            close_dfk()
+            after_cleanup = first_checkpoint.exists()
+
+            @python_app(cache=True)
+            def durable(token, value):
+                import os
+                fd = os.open("marker.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                try: os.write(fd, (token + "\\n").encode()); os.fsync(fd)
+                finally: os.close(fd)
+                return value
+
+            second_dfk = parsl.load(config(run_root, mode="task_exit", threads=2))
+            second = durable(TOKEN, VALUE)
+            second_value = second.result(timeout=10)
+            second_memo = bool(second.task_record.get("from_memo"))
+            second_run = Path(second_dfk.run_dir).name
+            close_dfk()
+            emit({{
+                "first_value": first_value,
+                "failure_message": failure_message,
+                "first_run": first_run,
+                "before_cleanup": before_cleanup,
+                "after_cleanup": after_cleanup,
+                "second_value": second_value,
+                "second_memo": second_memo,
+                "second_run": second_run,
+                "executions": Path("marker.log").read_text().splitlines(),
+            }})
+            ''',
+        )
+        self.assertEqual(report["first_value"], value)
+        self.assertEqual(report["failure_message"], f"terminal-{token}")
+        self.assertEqual(report["first_run"], "000")
+        self.assertFalse(report["before_cleanup"])
+        self.assertFalse(report["after_cleanup"])
+        self.assertEqual(report["second_value"], value)
+        self.assertFalse(report["second_memo"])
+        self.assertEqual(report["second_run"], "001")
+        self.assertEqual(report["executions"], [token])
+
 def main() -> int:
     global WORKSPACE, TEST_ROOT
     inherited_fd = os.environ.pop("PARSL_VERIFIER_FD", "")
